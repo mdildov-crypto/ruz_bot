@@ -26,7 +26,7 @@ from ruz_client import Lesson, RuzClient, RuzApiError, fetch_full_schedule
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
-print("DEBUG BOT_TOKEN repr:", repr(settings.bot_token), flush=True)
+import os as _os print("DEBUG ALL ENV KEYS CONTAINING 'TOKEN':", [k for k in _os.environ if "TOKEN" in k.upper()], flush=True) print("DEBUG BOT_TOKEN repr:", repr(settings.bot_token), flush=True)
 bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 ruz = RuzClient()
