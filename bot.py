@@ -77,9 +77,8 @@ def today_date_label() -> str:
     d = date.today()
     return f"📌 {d.day} {RU_MONTHS_GEN[d.month - 1]}"
 
-
 def is_today_date_button(message: Message) -> bool:
-    return message.text == today_date_label()
+    return bool(message.text) and message.text.startswith("📌 ")
 
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
@@ -158,7 +157,7 @@ async def _send_day(message: Message, day: date):
     except RuzApiError as e:
         await message.answer(f"⚠️ Не получилось получить расписание: {e}")
         return
-    await message.answer(format_day(day, _lessons_for_day(lessons, day)))
+    await message.answer(format_day(day, _lessons_for_day(lessons, day)), reply_markup=main_menu_kb())
 
 
 @dp.message(Command("week"))
