@@ -29,7 +29,7 @@ def _kind_emoji(kind: str) -> str:
     return "📚"
 
 
-def _fmt_lesson_line(lesson: Lesson) -> str:
+def _fmt_lesson_line(lesson: Lesson, note: str | None = None) -> str:
     emo = _kind_emoji(lesson.kind)
     time_part = f"{lesson.time_start}–{lesson.time_end}" if lesson.time_start else "—"
     place = " ".join(p for p in [lesson.building, lesson.room] if p)
@@ -43,19 +43,22 @@ def _fmt_lesson_line(lesson: Lesson) -> str:
         extra.append(f"ауд. {place}")
     if extra:
         lines.append("    " + " · ".join(extra))
+    if note:
+        lines.append(f"    📝 <i>{note}</i>")
     return "\n".join(lines)
 
 
-def format_day(day: date, lessons: list[Lesson]) -> str:
+def format_day(day: date, lessons: list[Lesson], notes: dict[str, str] | None = None) -> str:
+    notes = notes or {}
     weekday = WEEKDAYS_RU[day.weekday()]
     header = f"🗓 <b>{weekday}, {day.strftime('%d.%m.%Y')}</b>"
     if not lessons:
         return f"{header}\n\nПар нет 🎉"
-    body = "\n\n".join(_fmt_lesson_line(l) for l in lessons)
+    body = "\n\n".join(_fmt_lesson_line(l, notes.get(l.key())) for l in lessons)
     return f"{header}\n\n{body}"
 
 
-def format_week(start: date, lessons: list[Lesson]) -> str:
+def format_week(start: date, lessons: list[Lesson], notes: dict[str, str] | None = None) -> str:
     """lessons — уже отфильтрованы под нужную неделю (7 дней от start)."""
     by_day: dict[str, list[Lesson]] = {}
     for l in lessons:
@@ -66,7 +69,7 @@ def format_week(start: date, lessons: list[Lesson]) -> str:
         d = start + timedelta(days=i)
         iso = d.isoformat()
         day_lessons = by_day.get(iso, [])
-        chunks.append(format_day(d, day_lessons))
+        chunks.append(format_day(d, day_lessons, notes))
     return "\n\n➖➖➖➖➖\n\n".join(chunks)
 
 
