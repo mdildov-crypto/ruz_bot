@@ -16,6 +16,7 @@ def _empty_state() -> dict[str, Any]:
         "group_id": None,        # найденный id группы (кэш, чтобы не искать каждый раз)
         "group_label": None,     # как группа называется на сайте (для проверки)
         "lessons": {},           # snapshot: key -> lesson dict
+        "notes": {},             # заметки: str(chat_id) -> {lesson_key: текст заметки}
     }
 
 
@@ -55,5 +56,28 @@ def remove_subscriber(chat_id: int) -> bool:
     if chat_id not in state["chat_ids"]:
         return False
     state["chat_ids"].remove(chat_id)
+    save(state)
+    return True
+
+
+def get_notes(chat_id: int) -> dict[str, str]:
+    state = load()
+    return state.get("notes", {}).get(str(chat_id), {})
+
+
+def set_note(chat_id: int, lesson_key: str, text: str) -> None:
+    state = load()
+    notes = state.setdefault("notes", {})
+    user_notes = notes.setdefault(str(chat_id), {})
+    user_notes[lesson_key] = text
+    save(state)
+
+
+def delete_note(chat_id: int, lesson_key: str) -> bool:
+    state = load()
+    user_notes = state.get("notes", {}).get(str(chat_id), {})
+    if lesson_key not in user_notes:
+        return False
+    del user_notes[lesson_key]
     save(state)
     return True
