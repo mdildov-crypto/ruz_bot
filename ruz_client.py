@@ -82,10 +82,16 @@ class RuzClient:
         Бросает RuzApiError, если ничего не нашлось или API ответило
         не так, как ожидалось.
         """
-        resp = await self._client.get(
-            "/api/search",
-            params={"term": group_name, "type": "group"},
-        )
+        try:
+            resp = await self._client.get(
+                "/api/search",
+                params={"term": group_name, "type": "group"},
+            )
+        except httpx.HTTPError as e:
+            raise RuzApiError(
+                "Сайт с расписанием сейчас не отвечает (проблема на его стороне). "
+                "Попробуй ещё раз через минуту."
+            ) from e
         if resp.status_code != 200:
             raise RuzApiError(
                 f"Поиск группы вернул код {resp.status_code}. "
@@ -128,14 +134,20 @@ class RuzClient:
     async def get_schedule(
         self, group_id: str, start: date, finish: date
     ) -> list[Lesson]:
-        resp = await self._client.get(
-            f"/api/schedule/group/{group_id}",
-            params={
-                "start": start.strftime(DATE_FMT),
-                "finish": finish.strftime(DATE_FMT),
-                "lng": 1,
-            },
-        )
+        try:
+            resp = await self._client.get(
+                f"/api/schedule/group/{group_id}",
+                params={
+                    "start": start.strftime(DATE_FMT),
+                    "finish": finish.strftime(DATE_FMT),
+                    "lng": 1,
+                },
+            )
+        except httpx.HTTPError as e:
+            raise RuzApiError(
+                "Сайт с расписанием сейчас не отвечает (проблема на его стороне). "
+                "Попробуй ещё раз через минуту."
+            ) from e
         if resp.status_code != 200:
             raise RuzApiError(
                 f"Запрос расписания вернул код {resp.status_code}. "
