@@ -7,6 +7,8 @@ from datetime import date, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -77,7 +79,10 @@ def today_date_label() -> str:
     d = date.today()
     return f"📌 {d.day} {RU_MONTHS_GEN[d.month - 1]}"
 
+
 def is_today_date_button(message: Message) -> bool:
+    # Сравниваем по префиксу 📌, а не по точной дате — иначе кнопка
+    # перестаёт работать на следующий день, пока клавиатура не обновится.
     return bool(message.text) and message.text.startswith("📌 ")
 
 
@@ -104,6 +109,21 @@ def week_kb(monday: date) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+class NoteStates(StatesGroup):
+    waiting_text = State()
+
+
+def note_picker_kb(day_lessons: list[Lesson]) -> InlineKeyboardMarkup:
+    """Кнопки со списком пар этого дня — выбрать, к какой добавить заметку."""
+    buttons = []
+    for l in day_lessons:
+        label = f"{l.time_start} {l.subject}"
+        if len(label) > 40:
+            label = label[:37] + "…"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"note:{l.key()}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +177,14 @@ async def _send_day(message: Message, day: date):
     except RuzApiError as e:
         await message.answer(f"⚠️ Не получилось получить расписание: {e}")
         return
-    await message.answer(format_day(day, _lessons_for_day(lessons, day)), reply_markup=main_menu_kb())
+    day_lessons = _lessons_for_day(lessons, day)
+    notes = storage.get_notes(message.chat.id)
+    await message.answer(format_day(day, day_lessons, notes), reply_markup=main_menu_kb())
+    if day_lessons:
+        await message.answer(
+            "Добавить заметку к какой-то паре в этот день?",
+            reply_markup=note_picker_kb(day_lessons),
+        )
 
 
 @dp.message(Command("week"))
@@ -179,7 +206,8 @@ async def _send_week(message: Message, offset_weeks: int):
         return
     today = date.today()
     monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset_weeks)
-    await message.answer(format_week(monday, lessons), reply_markup=week_kb(monday))
+    notes = storage.get_notes(message.chat.id)
+    await message.answer(format_week(monday, lessons, notes), reply_markup=week_kb(monday))
 
 
 @dp.callback_query(F.data.startswith("week:"))
@@ -191,8 +219,34 @@ async def cb_week(callback: CallbackQuery):
     except RuzApiError as e:
         await callback.answer(f"Ошибка: {e}", show_alert=True)
         return
-    await callback.message.edit_text(format_week(monday, lessons), reply_markup=week_kb(monday))
+    notes = storage.get_notes(callback.message.chat.id)
+    await callback.message.edit_text(format_week(monday, lessons, notes), reply_markup=week_kb(monday))
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("note:"))
+async def cb_note_pick(callback: CallbackQuery, state: FSMContext):
+    """Пара выбрана — просим текст заметки."""
+    lesson_key = callback.data.split(":", 1)[1]
+    await state.update_data(lesson_key=lesson_key)
+    await state.set_state(NoteStates.waiting_text)
+    await callback.message.answer(
+        "Напиши текст заметки к этой паре (или отправь /cancel, чтобы отменить):"
+    )
+    await callback.answer()
+
+
+@dp.message(NoteStates.waiting_text)
+async def note_text_received(message: Message, state: FSMContext):
+    if message.text and message.text.strip().lower() == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    data = await state.get_data()
+    lesson_key = data.get("lesson_key")
+    storage.set_note(message.chat.id, lesson_key, message.text or "")
+    await state.clear()
+    await message.answer("Заметка сохранена ✅ Она будет видна вместе с этой парой в расписании.")
 
 
 @dp.message(Command("check"))
