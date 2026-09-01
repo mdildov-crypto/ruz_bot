@@ -43,6 +43,8 @@ def _fmt_lesson_line(lesson: Lesson, note: str | None = None) -> str:
         extra.append(f"ауд. {place}")
     if extra:
         lines.append("    " + " · ".join(extra))
+    if lesson.detail:
+        lines.append(f"    👥 {lesson.detail}")
     if note:
         lines.append(f"    📝 <i>{note}</i>")
     return "\n".join(lines)
