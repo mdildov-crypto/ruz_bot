@@ -41,6 +41,7 @@ class Lesson:
     teacher: str
     room: str
     building: str
+    detail: str = ""          # доп. пометка с сайта (например, подгруппа "1" или "2")
 
     def key(self) -> str:
         """Уникальный ключ пары — по нему сверяем 'та же это пара или другая'."""
@@ -51,7 +52,17 @@ class Lesson:
 
     @staticmethod
     def from_dict(d: dict) -> "Lesson":
-        return Lesson(**d)
+        return Lesson(
+            lesson_date=d.get("lesson_date", ""),
+            time_start=d.get("time_start", ""),
+            time_end=d.get("time_end", ""),
+            subject=d.get("subject", ""),
+            kind=d.get("kind", ""),
+            teacher=d.get("teacher", ""),
+            room=d.get("room", ""),
+            building=d.get("building", ""),
+            detail=d.get("detail", ""),
+        )
 
 
 class RuzApiError(RuntimeError):
@@ -191,6 +202,7 @@ class RuzClient:
                 teacher=self._pick(item, "lecturer", "teacher", "fio"),
                 room=self._pick(item, "auditorium", "room", "cabinet"),
                 building=self._pick(item, "building", "housing", "campus"),
+                detail=self._pick(item, "detailInfo", "subGroup", "stream", "streamName", "note"),
             )
         except Exception as e:  # noqa: BLE001
             log.warning("Не смог разобрать запись пары: %s (%s)", item, e)
