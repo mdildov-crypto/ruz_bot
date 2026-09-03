@@ -13,9 +13,8 @@ _lock = threading.Lock()
 def _empty_state() -> dict[str, Any]:
     return {
         "chat_ids": [],          # кто подписан на уведомления об изменениях
-        "group_id": None,        # найденный id группы (кэш, чтобы не искать каждый раз)
-        "group_label": None,     # как группа называется на сайте (для проверки)
-        "lessons": {},           # snapshot: key -> lesson dict
+        "user_group": {},        # str(chat_id) -> название группы (какую выбрал пользователь)
+        "groups": {},            # название группы -> {"group_id":.., "group_label":.., "lessons": {key: dict}}
         "notes": {},             # заметки: str(chat_id) -> {lesson_key: текст заметки}
     }
 
@@ -58,6 +57,44 @@ def remove_subscriber(chat_id: int) -> bool:
     state["chat_ids"].remove(chat_id)
     save(state)
     return True
+
+
+def get_user_group(chat_id: int) -> str | None:
+    state = load()
+    return state.get("user_group", {}).get(str(chat_id))
+
+
+def set_user_group(chat_id: int, group_name: str) -> None:
+    state = load()
+    state.setdefault("user_group", {})[str(chat_id)] = group_name
+    save(state)
+
+
+def get_group_cache(group_name: str) -> dict[str, Any]:
+    state = load()
+    return state.get("groups", {}).get(group_name, {})
+
+
+def set_group_id(group_name: str, group_id: str, label: str) -> None:
+    state = load()
+    groups = state.setdefault("groups", {})
+    g = groups.setdefault(group_name, {})
+    g["group_id"] = group_id
+    g["group_label"] = label
+    save(state)
+
+
+def get_group_lessons_snapshot(group_name: str) -> dict[str, Any]:
+    state = load()
+    return state.get("groups", {}).get(group_name, {}).get("lessons", {})
+
+
+def set_group_lessons_snapshot(group_name: str, snapshot: dict[str, Any]) -> None:
+    state = load()
+    groups = state.setdefault("groups", {})
+    g = groups.setdefault(group_name, {})
+    g["lessons"] = snapshot
+    save(state)
 
 
 def get_notes(chat_id: int) -> dict[str, str]:
