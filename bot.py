@@ -34,29 +34,48 @@ ruz = RuzClient()
 
 
 # ---------------------------------------------------------------------------
-# Вспомогательное: получить (и закэшировать) id группы
+# Работа с группами: поиск id на сайте (с кэшем) + получение расписания
 # ---------------------------------------------------------------------------
-async def get_group_id() -> str:
-    state = storage.load()
-    if state.get("group_id"):
-        return state["group_id"]
-
-    group_id, label = await ruz.find_group_id(settings.group_name)
-    state["group_id"] = group_id
-    state["group_label"] = label
-    storage.save(state)
+async def resolve_group_id(group_name: str) -> str:
+    cached = storage.get_group_cache(group_name)
+    if cached.get("group_id"):
+        return cached["group_id"]
+    group_id, label = await ruz.find_group_id(group_name)
+    storage.set_group_id(group_name, group_id, label)
     log.info("Группа определена: %s -> id=%s", label, group_id)
     return group_id
 
 
-async def get_current_lessons() -> list[Lesson]:
-    group_id = await get_group_id()
+async def get_lessons_for_group(group_name: str) -> list[Lesson]:
+    group_id = await resolve_group_id(group_name)
     return await fetch_full_schedule(ruz, group_id)
 
 
 def _lessons_for_day(lessons: list[Lesson], day: date) -> list[Lesson]:
     iso = day.isoformat()
     return [l for l in lessons if l.lesson_date == iso]
+
+
+def _short_group_label(group_name: str) -> str:
+    """Короткая подпись для кнопки выбора группы, например 'Б.МН.25.Б3' -> 'Б3'."""
+    return group_name.split(".")[-1] if "." in group_name else group_name
+
+
+def group_picker_kb() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=g, callback_data=f"group:{g}")]
+        for g in settings.group_list()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def require_user_group(message: Message) -> str | None:
+    """Возвращает выбранную пользователем группу, либо просит выбрать и возвращает None."""
+    group_name = storage.get_user_group(message.chat.id)
+    if not group_name:
+        await message.answer("Сначала выбери свою группу:", reply_markup=group_picker_kb())
+        return None
+    return group_name
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +85,7 @@ BTN_TODAY = "📅 Сегодня"
 BTN_TOMORROW = "📆 Завтра"
 BTN_WEEK = "🗓 Эта неделя"
 BTN_CHECK = "🔄 Проверить изменения"
+BTN_CHANGE_GROUP = "🔁 Сменить группу"
 
 RU_MONTHS_GEN = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
@@ -92,6 +112,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_TOMORROW)],
             [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=today_date_label())],
             [KeyboardButton(text=BTN_CHECK)],
+            [KeyboardButton(text=BTN_CHANGE_GROUP)],
         ],
         resize_keyboard=True,
     )
@@ -132,14 +153,38 @@ def note_picker_kb(day_lessons: list[Lesson]) -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     added_now = storage.add_subscriber(message.chat.id)
-    text = (
-        "Привет! Я показываю расписание пар группы "
-        f"<b>{settings.group_name}</b> и сообщаю, когда сайт что-то меняет.\n\n"
-        "Пользуйся кнопками внизу 👇"
-    )
+    group_name = storage.get_user_group(message.chat.id)
+
+    if not group_name:
+        await message.answer(
+            "Привет! Я показываю расписание пар и сообщаю, когда сайт что-то меняет.\n\n"
+            "Сначала выбери свою группу:",
+            reply_markup=group_picker_kb(),
+        )
+        return
+
+    text = f"Привет! Твоя группа: <b>{group_name}</b>.\n\nПользуйся кнопками внизу 👇"
     if added_now:
         text += "\n\nТы подписан(а) на уведомления об изменениях в расписании ✅"
     await message.answer(text, reply_markup=main_menu_kb())
+
+
+@dp.message(Command("group"))
+@dp.message(F.text == BTN_CHANGE_GROUP)
+async def cmd_change_group(message: Message):
+    await message.answer("Выбери свою группу:", reply_markup=group_picker_kb())
+
+
+@dp.callback_query(F.data.startswith("group:"))
+async def cb_group_picked(callback: CallbackQuery):
+    group_name = callback.data.split(":", 1)[1]
+    storage.set_user_group(callback.message.chat.id, group_name)
+    storage.add_subscriber(callback.message.chat.id)
+    await callback.message.answer(
+        f"Готово! Твоя группа: <b>{group_name}</b>.\n\nПользуйся кнопками внизу 👇",
+        reply_markup=main_menu_kb(),
+    )
+    await callback.answer()
 
 
 @dp.message(Command("subscribe"))
@@ -162,18 +207,24 @@ async def cmd_unsubscribe(message: Message):
 @dp.message(F.text == BTN_TODAY)
 @dp.message(is_today_date_button)
 async def cmd_today(message: Message):
-    await _send_day(message, date.today())
+    group_name = await require_user_group(message)
+    if not group_name:
+        return
+    await _send_day(message, group_name, date.today())
 
 
 @dp.message(Command("tomorrow"))
 @dp.message(F.text == BTN_TOMORROW)
 async def cmd_tomorrow(message: Message):
-    await _send_day(message, date.today() + timedelta(days=1))
+    group_name = await require_user_group(message)
+    if not group_name:
+        return
+    await _send_day(message, group_name, date.today() + timedelta(days=1))
 
 
-async def _send_day(message: Message, day: date):
+async def _send_day(message: Message, group_name: str, day: date):
     try:
-        lessons = await get_current_lessons()
+        lessons = await get_lessons_for_group(group_name)
     except RuzApiError as e:
         await message.answer(f"⚠️ Не получилось получить расписание: {e}")
         return
@@ -190,17 +241,23 @@ async def _send_day(message: Message, day: date):
 @dp.message(Command("week"))
 @dp.message(F.text == BTN_WEEK)
 async def cmd_week(message: Message):
-    await _send_week(message, offset_weeks=0)
+    group_name = await require_user_group(message)
+    if not group_name:
+        return
+    await _send_week(message, group_name, offset_weeks=0)
 
 
 @dp.message(Command("nextweek"))
 async def cmd_next_week(message: Message):
-    await _send_week(message, offset_weeks=1)
+    group_name = await require_user_group(message)
+    if not group_name:
+        return
+    await _send_week(message, group_name, offset_weeks=1)
 
 
-async def _send_week(message: Message, offset_weeks: int):
+async def _send_week(message: Message, group_name: str, offset_weeks: int):
     try:
-        lessons = await get_current_lessons()
+        lessons = await get_lessons_for_group(group_name)
     except RuzApiError as e:
         await message.answer(f"⚠️ Не получилось получить расписание: {e}")
         return
@@ -213,9 +270,13 @@ async def _send_week(message: Message, offset_weeks: int):
 @dp.callback_query(F.data.startswith("week:"))
 async def cb_week(callback: CallbackQuery):
     """Листание недель вперёд/назад по кнопкам под сообщением."""
+    group_name = storage.get_user_group(callback.message.chat.id)
+    if not group_name:
+        await callback.answer("Сначала выбери группу через /group", show_alert=True)
+        return
     monday = date.fromisoformat(callback.data.split(":", 1)[1])
     try:
-        lessons = await get_current_lessons()
+        lessons = await get_lessons_for_group(group_name)
     except RuzApiError as e:
         await callback.answer(f"Ошибка: {e}", show_alert=True)
         return
@@ -252,50 +313,64 @@ async def note_text_received(message: Message, state: FSMContext):
 @dp.message(Command("check"))
 @dp.message(F.text == BTN_CHECK)
 async def cmd_check(message: Message):
+    group_name = await require_user_group(message)
+    if not group_name:
+        return
     await message.answer("Проверяю сайт на изменения…")
-    changed = await check_for_changes(notify=True)
+    changed = await check_group_for_changes(group_name, notify_chat_ids=[message.chat.id])
     if not changed:
         await message.answer("Изменений нет, всё как было 👍")
 
 
 # ---------------------------------------------------------------------------
-# Фоновая проверка изменений
+# Фоновая проверка изменений (по всем группам, которые кто-то выбрал)
 # ---------------------------------------------------------------------------
-async def check_for_changes(notify: bool = True) -> bool:
-    state = storage.load()
+async def check_group_for_changes(group_name: str, notify_chat_ids: list[int] | None = None) -> bool:
+    """Проверяет ОДНУ группу и, если есть подписчики на неё, шлёт им изменения.
+    notify_chat_ids, если передан, используется вместо автопоиска подписчиков
+    (нужно для ручной команды /check одного пользователя)."""
     try:
-        new_lessons = await get_current_lessons()
+        new_lessons = await get_lessons_for_group(group_name)
     except RuzApiError as e:
-        log.warning("Проверка изменений не удалась: %s", e)
+        log.warning("Проверка изменений (%s) не удалась: %s", group_name, e)
         return False
 
-    old_lessons = [Lesson.from_dict(d) for d in state.get("lessons", {}).values()] \
-        if isinstance(state.get("lessons"), dict) else []
+    old_snapshot = storage.get_group_lessons_snapshot(group_name)
+    old_lessons = [Lesson.from_dict(d) for d in old_snapshot.values()]
 
     added, removed, changed = diff_schedules(old_lessons, new_lessons)
+    storage.set_group_lessons_snapshot(group_name, {l.key(): l.to_dict() for l in new_lessons})
 
-    # сохраняем новый снимок в любом случае
-    state = storage.load()
-    state["lessons"] = {l.key(): l.to_dict() for l in new_lessons}
-    storage.save(state)
+    if not old_snapshot:
+        # первый раз видим эту группу — просто запоминаем как есть, без уведомлений
+        return False
 
     if not (added or removed or changed):
         return False
 
-    if notify:
-        text = format_changes(added, removed, changed)
-        for chat_id in state.get("chat_ids", []):
-            try:
-                await bot.send_message(chat_id, text)
-            except Exception as e:  # noqa: BLE001
-                log.warning("Не смог отправить сообщение chat_id=%s: %s", chat_id, e)
+    text = format_changes(added, removed, changed)
+    chat_ids = notify_chat_ids
+    if chat_ids is None:
+        state = storage.load()
+        user_group = state.get("user_group", {})
+        subs = set(state.get("chat_ids", []))
+        chat_ids = [int(cid) for cid, g in user_group.items() if g == group_name and int(cid) in subs]
+
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не смог отправить сообщение chat_id=%s: %s", chat_id, e)
 
     return True
 
 
 async def scheduled_check():
     log.info("Плановая проверка расписания…")
-    await check_for_changes(notify=True)
+    state = storage.load()
+    groups_in_use = sorted(set(state.get("user_group", {}).values()))
+    for group_name in groups_in_use:
+        await check_group_for_changes(group_name)
 
 
 # ---------------------------------------------------------------------------
@@ -304,23 +379,6 @@ async def scheduled_check():
 async def main():
     if not settings.bot_token:
         raise SystemExit("Не задан BOT_TOKEN (переменная окружения). Смотри .env.example")
-
-    # первичная инициализация: определяем группу и делаем стартовый снимок,
-    # чтобы первая же плановая проверка не разослала "изменения" на пустом месте
-    try:
-        await get_group_id()
-        state = storage.load()
-        if not state.get("lessons"):
-            lessons = await get_current_lessons()
-            state["lessons"] = {l.key(): l.to_dict() for l in lessons}
-            storage.save(state)
-            log.info("Стартовый снимок расписания сохранён (%d пар).", len(lessons))
-    except RuzApiError as e:
-        log.error(
-            "Не удалось инициализировать расписание при старте: %s\n"
-            "Бот всё равно запустится, но проверь адрес API (см. README / check_api.py).",
-            e,
-        )
 
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
     scheduler.add_job(scheduled_check, "interval", minutes=settings.check_interval_minutes)
