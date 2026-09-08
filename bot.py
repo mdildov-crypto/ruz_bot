@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import date, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -131,7 +132,8 @@ class NoteStates(StatesGroup):
 
 
 class GroupSearchStates(StatesGroup):
-    waiting_query = State()
+    waiting_direction = State()
+    waiting_year = State()
 
 
 def note_picker_kb(day_lessons: list[Lesson]) -> InlineKeyboardMarkup:
@@ -195,22 +197,26 @@ async def cb_group_picked(callback: CallbackQuery):
 
 @dp.callback_query(F.data == GROUP_SEARCH_CB)
 async def cb_group_search_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(GroupSearchStates.waiting_query)
+    await state.set_state(GroupSearchStates.waiting_direction)
     await callback.message.answer(
-        "Напиши название своей группы (или его часть) — поищу на сайте:"
+        "Напиши своё направление/факультет (например «Менеджмент» или «Землеустройство»), "
+        "или сразу полное название группы, если знаешь:"
     )
     await callback.answer()
 
 
-@dp.message(GroupSearchStates.waiting_query)
-async def group_search_query_received(message: Message, state: FSMContext):
+YEAR_RE = re.compile(r"\.(\d{2})\.")
+
+
+@dp.message(GroupSearchStates.waiting_direction)
+async def group_search_direction_received(message: Message, state: FSMContext):
     if message.text and message.text.strip().lower() == "/cancel":
         await state.clear()
         await message.answer("Отменено.")
         return
     query = (message.text or "").strip()
     if not query:
-        await message.answer("Пришли текстом название группы.")
+        await message.answer("Пришли текстом название направления или группы.")
         return
     await message.answer("Ищу…")
     try:
@@ -218,13 +224,16 @@ async def group_search_query_received(message: Message, state: FSMContext):
     except RuzApiError as e:
         await message.answer(f"⚠️ Не получилось найти: {e}")
         return
-    await state.clear()
+
     if not results:
         await message.answer(
-            "Ничего не нашлось. Попробуй ввести название иначе (например, короче) через /group."
+            "Ничего не нашлось. Попробуй ввести иначе (короче, или полное название группы), "
+            "либо /cancel, чтобы отменить."
         )
         return
+
     if len(results) == 1:
+        await state.clear()
         group_id, label = results[0]
         storage.set_group_id(label, group_id, label)
         storage.set_user_group(message.chat.id, label)
@@ -234,10 +243,57 @@ async def group_search_query_received(message: Message, state: FSMContext):
             reply_markup=main_menu_kb(),
         )
         return
+
+    years = sorted({m.group(1) for _, label in results if (m := YEAR_RE.search(label))}, reverse=True)
+
+    if len(years) <= 1:
+        # курс не определить по названиям (или он один и тот же у всех) — сразу список групп
+        await state.clear()
+        await message.answer(
+            f"Нашлось несколько вариантов ({len(results)}), выбери свою группу:",
+            reply_markup=group_results_kb(results),
+        )
+        return
+
+    await state.update_data(candidates=results)
+    await state.set_state(GroupSearchStates.waiting_year)
+    buttons = [[InlineKeyboardButton(text=f"20{y} год поступления", callback_data=f"gsyear:{y}")] for y in years]
     await message.answer(
-        f"Нашлось несколько вариантов ({len(results)}), выбери свою группу:",
-        reply_markup=group_results_kb(results),
+        f"Нашлось много групп ({len(results)}). Какой у тебя курс (год поступления)?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+
+
+@dp.callback_query(F.data.startswith("gsyear:"))
+async def cb_group_search_year(callback: CallbackQuery, state: FSMContext):
+    year = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    candidates: list[tuple[str, str]] = data.get("candidates", [])
+    await state.clear()
+
+    pattern = re.compile(rf"\.{re.escape(year)}\.")
+    filtered = [(gid, label) for gid, label in candidates if pattern.search(label)]
+
+    if not filtered:
+        await callback.message.answer("Не нашлось групп этого года по такому запросу, попробуй ещё раз через /group.")
+        await callback.answer()
+        return
+
+    if len(filtered) == 1:
+        group_id, label = filtered[0]
+        storage.set_group_id(label, group_id, label)
+        storage.set_user_group(callback.message.chat.id, label)
+        storage.add_subscriber(callback.message.chat.id)
+        await callback.message.answer(
+            f"Готово! Твоя группа: <b>{label}</b>.\n\nПользуйся кнопками внизу 👇",
+            reply_markup=main_menu_kb(),
+        )
+    else:
+        await callback.message.answer(
+            f"Нашлось {len(filtered)} групп этого курса, выбери свою:",
+            reply_markup=group_results_kb(filtered),
+        )
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("grouppick:"))
