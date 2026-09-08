@@ -1,16 +1,9 @@
 """
 Клиент для сайта расписания (ruz.guz.ru).
 
-ВАЖНО: сайт — это одностраничное приложение (SPA), которое само по себе
-не отдаёт HTML с расписанием, а ходит в свой JSON-API. Ниже реализован
-клиент под самый распространённый вариант такого API ("Тандем РУЗ" —
-похожая система стоит на многих вузовских сайтах: /ruz/api/search и
-/ruz/api/schedule/group/{id}).
-
-Если после запуска check_api.py окажется, что реальные адреса или поля
-в ответе другие — их нужно поправить именно здесь (см. комментарии
-"ПОДСТРОЙКА" ниже) и в README.md написано, как их найти через
-DevTools браузера за 2 минуты.
+Сайт — одностраничное приложение (SPA), которое ходит в свой JSON-API:
+/api/search (поиск группы по названию) и /api/schedule/group/{id}
+(само расписание).
 """
 
 from __future__ import annotations
@@ -85,18 +78,14 @@ class RuzClient:
         await self._client.aclose()
 
     # ------------------------------------------------------------------
-    # ПОДСТРОЙКА №1: поиск группы по названию -> её внутренний id
+    # Поиск групп по названию (может вернуть несколько совпадений)
     # ------------------------------------------------------------------
-    async def find_group_id(self, group_name: str) -> tuple[str, str]:
-        """
-        Возвращает (id_группы, точное_название_как_на_сайте).
-        Бросает RuzApiError, если ничего не нашлось или API ответило
-        не так, как ожидалось.
-        """
+    async def search_groups(self, term: str) -> list[tuple[str, str]]:
+        """Возвращает список (id, label) — все совпадения с сайта по запросу term."""
         try:
             resp = await self._client.get(
                 "/api/search",
-                params={"term": group_name, "type": "group"},
+                params={"term": term, "type": "group"},
             )
         except httpx.HTTPError as e:
             raise RuzApiError(
@@ -118,29 +107,33 @@ class RuzClient:
             )
 
         candidates = data if isinstance(data, list) else data.get("items", data)
-        if not candidates:
+        results: list[tuple[str, str]] = []
+        for c in candidates:
+            group_id = str(c.get("id") or c.get("groupId") or c.get("value") or "")
+            label = str(c.get("label") or c.get("name") or c.get("value") or "")
+            if group_id and group_id != "None" and label:
+                results.append((group_id, label))
+        return results
+
+    async def find_group_id(self, group_name: str) -> tuple[str, str]:
+        """
+        Возвращает (id_группы, точное_название_как_на_сайте) для точного
+        совпадения по названию (или первого результата, если точного нет).
+        Бросает RuzApiError, если ничего не нашлось.
+        """
+        results = await self.search_groups(group_name)
+        if not results:
             raise RuzApiError(f"Группа «{group_name}» не найдена на сайте.")
 
-        # ищем точное совпадение по названию, иначе берём первый результат
         exact = None
-        for c in candidates:
-            label = str(c.get("label") or c.get("name") or c.get("value") or "")
+        for group_id, label in results:
             if label.strip().lower() == group_name.strip().lower():
-                exact = c
+                exact = (group_id, label)
                 break
-        chosen = exact or candidates[0]
-
-        group_id = str(chosen.get("id") or chosen.get("groupId") or chosen.get("value"))
-        label = str(chosen.get("label") or chosen.get("name") or group_name)
-        if not group_id or group_id == "None":
-            raise RuzApiError(
-                "Не удалось достать id группы из ответа API — формат "
-                "ответа отличается от ожидаемого (см. README)."
-            )
-        return group_id, label
+        return exact or results[0]
 
     # ------------------------------------------------------------------
-    # ПОДСТРОЙКА №2: расписание группы за диапазон дат
+    # Расписание группы за диапазон дат
     # ------------------------------------------------------------------
     async def get_schedule(
         self, group_id: str, start: date, finish: date
@@ -186,10 +179,6 @@ class RuzClient:
         return default
 
     def _normalize_lesson(self, item: dict[str, Any]) -> Lesson | None:
-        """
-        Пытается разобрать запись о паре из разных вероятных форматов
-        полей (в разных версиях этого API поля называются по-разному).
-        """
         try:
             raw_date = self._pick(item, "date", "lessonDate", "day")
             lesson_date = self._to_iso_date(raw_date)
@@ -214,7 +203,7 @@ class RuzClient:
         if "." in raw:  # dd.mm.yyyy
             d, m, y = raw.split(".")[:3]
             return f"{y}-{int(m):02d}-{int(d):02d}"
-        if "-" in raw and len(raw) >= 10:  # уже похоже на yyyy-mm-dd (возможно с временем)
+        if "-" in raw and len(raw) >= 10:
             return raw[:10]
         return raw
 
