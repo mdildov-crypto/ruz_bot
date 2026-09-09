@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import date, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -56,9 +57,30 @@ def _lessons_for_day(lessons: list[Lesson], day: date) -> list[Lesson]:
     return [l for l in lessons if l.lesson_date == iso]
 
 
-def _short_group_label(group_name: str) -> str:
-    """Короткая подпись для кнопки выбора группы, например 'Б.МН.25.Б3' -> 'Б3'."""
-    return group_name.split(".")[-1] if "." in group_name else group_name
+# ---------------------------------------------------------------------------
+# Справочники факультетов/групп — кэшируем в памяти процесса, чтобы не
+# дёргать сайт заново на каждое нажатие кнопки
+# ---------------------------------------------------------------------------
+_faculties_cache: list[dict] | None = None
+_groups_dict_cache: list[dict] | None = None
+
+
+async def get_faculties_cached() -> list[dict]:
+    global _faculties_cache
+    if _faculties_cache is None:
+        _faculties_cache = await ruz.get_faculties()
+    return _faculties_cache
+
+
+async def get_groups_dict_cached() -> list[dict]:
+    global _groups_dict_cache
+    if _groups_dict_cache is None:
+        _groups_dict_cache = await ruz.get_groups_dictionary()
+    return _groups_dict_cache
+
+
+GROUP_SEARCH_CB = "group_search"
+FACULTY_PICK_CB = "faculty_pick"
 
 
 def group_picker_kb() -> InlineKeyboardMarkup:
@@ -66,6 +88,8 @@ def group_picker_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=g, callback_data=f"group:{g}")]
         for g in settings.group_list()
     ]
+    buttons.append([InlineKeyboardButton(text="🏫 Факультет → курс → группа", callback_data=FACULTY_PICK_CB)])
+    buttons.append([InlineKeyboardButton(text="🔍 Другая группа (текстом)", callback_data=GROUP_SEARCH_CB)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -94,15 +118,11 @@ RU_MONTHS_GEN = [
 
 
 def today_date_label() -> str:
-    """Кнопка с сегодняшней датой — пересчитывается каждый раз заново,
-    так что всегда показывает актуальное число."""
     d = date.today()
     return f"📌 {d.day} {RU_MONTHS_GEN[d.month - 1]}"
 
 
 def is_today_date_button(message: Message) -> bool:
-    # Сравниваем по префиксу 📌, а не по точной дате — иначе кнопка
-    # перестаёт работать на следующий день, пока клавиатура не обновится.
     return bool(message.text) and message.text.startswith("📌 ")
 
 
@@ -119,7 +139,6 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 
 def week_kb(monday: date) -> InlineKeyboardMarkup:
-    """Кнопки ◀ / ▶ под самим расписанием — можно листать сколько угодно недель."""
     prev_monday = (monday - timedelta(weeks=1)).isoformat()
     next_monday = (monday + timedelta(weeks=1)).isoformat()
     return InlineKeyboardMarkup(
@@ -136,14 +155,54 @@ class NoteStates(StatesGroup):
     waiting_text = State()
 
 
+class GroupSearchStates(StatesGroup):
+    waiting_direction = State()
+    waiting_year = State()
+
+
 def note_picker_kb(day_lessons: list[Lesson]) -> InlineKeyboardMarkup:
-    """Кнопки со списком пар этого дня — выбрать, к какой добавить заметку."""
     buttons = []
     for l in day_lessons:
         label = f"{l.time_start} {l.subject}"
         if len(label) > 40:
             label = label[:37] + "…"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"note:{l.key()}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def group_results_kb(results: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """results — список (id, label) из поиска на сайте."""
+    buttons = [
+        [InlineKeyboardButton(text=label, callback_data=f"grouppick:{group_id}")]
+        for group_id, label in results[:20]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def faculties_kb(faculties: list[dict]) -> InlineKeyboardMarkup:
+    buttons = []
+    for f in faculties:
+        oid = f.get("facultyOid")
+        name = f.get("name") or f.get("abbr") or "?"
+        if oid is None:
+            continue
+        buttons.append([InlineKeyboardButton(text=str(name), callback_data=f"fac:{oid}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def courses_kb(courses: list[int]) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(text=f"{c} курс", callback_data=f"crs:{c}")] for c in courses]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def dict_groups_kb(groups: list[dict]) -> InlineKeyboardMarkup:
+    buttons = []
+    for g in groups[:40]:
+        oid = g.get("groupOid")
+        label = g.get("name") or g.get("number") or "?"
+        if oid is None:
+            continue
+        buttons.append([InlineKeyboardButton(text=str(label), callback_data=f"dgrp:{oid}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -182,6 +241,207 @@ async def cb_group_picked(callback: CallbackQuery):
     storage.add_subscriber(callback.message.chat.id)
     await callback.message.answer(
         f"Готово! Твоя группа: <b>{group_name}</b>.\n\nПользуйся кнопками внизу 👇",
+        reply_markup=main_menu_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == FACULTY_PICK_CB)
+async def cb_faculty_pick_start(callback: CallbackQuery):
+    try:
+        faculties = await get_faculties_cached()
+    except RuzApiError as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    if not faculties:
+        await callback.answer("Список факультетов пуст.", show_alert=True)
+        return
+    await callback.message.answer("Выбери факультет:", reply_markup=faculties_kb(faculties))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("fac:"))
+async def cb_faculty_chosen(callback: CallbackQuery, state: FSMContext):
+    faculty_oid = callback.data.split(":", 1)[1]
+    try:
+        groups = await get_groups_dict_cached()
+    except RuzApiError as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    matching = [g for g in groups if str(g.get("facultyOid")) == faculty_oid]
+    if not matching:
+        await callback.answer("У этого факультета не нашлось групп.", show_alert=True)
+        return
+    await state.update_data(faculty_oid=faculty_oid)
+    courses = sorted({g.get("course") for g in matching if g.get("course") is not None})
+    if len(courses) <= 1:
+        await callback.message.answer(f"Групп: {len(matching)}. Выбери свою:", reply_markup=dict_groups_kb(matching))
+    else:
+        await callback.message.answer("Какой курс?", reply_markup=courses_kb(courses))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("crs:"))
+async def cb_course_chosen(callback: CallbackQuery, state: FSMContext):
+    course = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    faculty_oid = data.get("faculty_oid")
+    try:
+        groups = await get_groups_dict_cached()
+    except RuzApiError as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    matching = [
+        g for g in groups
+        if str(g.get("facultyOid")) == str(faculty_oid) and str(g.get("course")) == course
+    ]
+    if not matching:
+        await callback.answer("Групп не нашлось.", show_alert=True)
+        return
+    await callback.message.answer(f"Групп: {len(matching)}. Выбери свою:", reply_markup=dict_groups_kb(matching))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("dgrp:"))
+async def cb_dict_group_chosen(callback: CallbackQuery, state: FSMContext):
+    group_id = callback.data.split(":", 1)[1]
+    label = None
+    if callback.message and callback.message.reply_markup:
+        for row in callback.message.reply_markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data == callback.data:
+                    label = btn.text
+    if not label:
+        await callback.answer("Не получилось определить группу, попробуй снова.", show_alert=True)
+        return
+    storage.set_group_id(label, group_id, label)
+    storage.set_user_group(callback.message.chat.id, label)
+    storage.add_subscriber(callback.message.chat.id)
+    await state.clear()
+    await callback.message.answer(
+        f"Готово! Твоя группа: <b>{label}</b>.\n\nПользуйся кнопками внизу 👇",
+        reply_markup=main_menu_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == GROUP_SEARCH_CB)
+async def cb_group_search_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(GroupSearchStates.waiting_direction)
+    await callback.message.answer(
+        "Напиши своё направление/факультет (например «Менеджмент» или «Землеустройство»), "
+        "или сразу полное название группы, если знаешь:"
+    )
+    await callback.answer()
+
+
+YEAR_RE = re.compile(r"\.(\d{2})\.")
+
+
+@dp.message(GroupSearchStates.waiting_direction)
+async def group_search_direction_received(message: Message, state: FSMContext):
+    if message.text and message.text.strip().lower() == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Пришли текстом название направления или группы.")
+        return
+    await message.answer("Ищу…")
+    try:
+        results = await ruz.search_groups(query)
+    except RuzApiError as e:
+        await message.answer(f"⚠️ Не получилось найти: {e}")
+        return
+
+    if not results:
+        await message.answer(
+            "Ничего не нашлось. Попробуй ввести иначе (короче, или полное название группы), "
+            "либо /cancel, чтобы отменить."
+        )
+        return
+
+    if len(results) == 1:
+        await state.clear()
+        group_id, label = results[0]
+        storage.set_group_id(label, group_id, label)
+        storage.set_user_group(message.chat.id, label)
+        storage.add_subscriber(message.chat.id)
+        await message.answer(
+            f"Готово! Твоя группа: <b>{label}</b>.\n\nПользуйся кнопками внизу 👇",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    years = sorted({m.group(1) for _, label in results if (m := YEAR_RE.search(label))}, reverse=True)
+
+    if len(years) <= 1:
+        await state.clear()
+        await message.answer(
+            f"Нашлось несколько вариантов ({len(results)}), выбери свою группу:",
+            reply_markup=group_results_kb(results),
+        )
+        return
+
+    await state.update_data(candidates=results)
+    await state.set_state(GroupSearchStates.waiting_year)
+    buttons = [[InlineKeyboardButton(text=f"20{y} год поступления", callback_data=f"gsyear:{y}")] for y in years]
+    await message.answer(
+        f"Нашлось много групп ({len(results)}). Какой у тебя курс (год поступления)?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@dp.callback_query(F.data.startswith("gsyear:"))
+async def cb_group_search_year(callback: CallbackQuery, state: FSMContext):
+    year = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    candidates: list[tuple[str, str]] = data.get("candidates", [])
+    await state.clear()
+
+    pattern = re.compile(rf"\.{re.escape(year)}\.")
+    filtered = [(gid, label) for gid, label in candidates if pattern.search(label)]
+
+    if not filtered:
+        await callback.message.answer("Не нашлось групп этого года по такому запросу, попробуй ещё раз через /group.")
+        await callback.answer()
+        return
+
+    if len(filtered) == 1:
+        group_id, label = filtered[0]
+        storage.set_group_id(label, group_id, label)
+        storage.set_user_group(callback.message.chat.id, label)
+        storage.add_subscriber(callback.message.chat.id)
+        await callback.message.answer(
+            f"Готово! Твоя группа: <b>{label}</b>.\n\nПользуйся кнопками внизу 👇",
+            reply_markup=main_menu_kb(),
+        )
+    else:
+        await callback.message.answer(
+            f"Нашлось {len(filtered)} групп этого курса, выбери свою:",
+            reply_markup=group_results_kb(filtered),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("grouppick:"))
+async def cb_group_pick_result(callback: CallbackQuery):
+    group_id = callback.data.split(":", 1)[1]
+    label = None
+    if callback.message and callback.message.reply_markup:
+        for row in callback.message.reply_markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data == callback.data:
+                    label = btn.text
+    if not label:
+        await callback.answer("Не получилось определить группу, попробуй снова.", show_alert=True)
+        return
+    storage.set_group_id(label, group_id, label)
+    storage.set_user_group(callback.message.chat.id, label)
+    storage.add_subscriber(callback.message.chat.id)
+    await callback.message.answer(
+        f"Готово! Твоя группа: <b>{label}</b>.\n\nПользуйся кнопками внизу 👇",
         reply_markup=main_menu_kb(),
     )
     await callback.answer()
@@ -269,7 +529,6 @@ async def _send_week(message: Message, group_name: str, offset_weeks: int):
 
 @dp.callback_query(F.data.startswith("week:"))
 async def cb_week(callback: CallbackQuery):
-    """Листание недель вперёд/назад по кнопкам под сообщением."""
     group_name = storage.get_user_group(callback.message.chat.id)
     if not group_name:
         await callback.answer("Сначала выбери группу через /group", show_alert=True)
@@ -287,7 +546,6 @@ async def cb_week(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("note:"))
 async def cb_note_pick(callback: CallbackQuery, state: FSMContext):
-    """Пара выбрана — просим текст заметки."""
     lesson_key = callback.data.split(":", 1)[1]
     await state.update_data(lesson_key=lesson_key)
     await state.set_state(NoteStates.waiting_text)
@@ -326,9 +584,6 @@ async def cmd_check(message: Message):
 # Фоновая проверка изменений (по всем группам, которые кто-то выбрал)
 # ---------------------------------------------------------------------------
 async def check_group_for_changes(group_name: str, notify_chat_ids: list[int] | None = None) -> bool:
-    """Проверяет ОДНУ группу и, если есть подписчики на неё, шлёт им изменения.
-    notify_chat_ids, если передан, используется вместо автопоиска подписчиков
-    (нужно для ручной команды /check одного пользователя)."""
     try:
         new_lessons = await get_lessons_for_group(group_name)
     except RuzApiError as e:
@@ -342,7 +597,6 @@ async def check_group_for_changes(group_name: str, notify_chat_ids: list[int] | 
     storage.set_group_lessons_snapshot(group_name, {l.key(): l.to_dict() for l in new_lessons})
 
     if not old_snapshot:
-        # первый раз видим эту группу — просто запоминаем как есть, без уведомлений
         return False
 
     if not (added or removed or changed):
