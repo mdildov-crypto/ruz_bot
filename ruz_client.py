@@ -133,6 +133,40 @@ class RuzClient:
         return exact or results[0]
 
     # ------------------------------------------------------------------
+    # Справочники: факультеты и полный список групп с курсом и привязкой
+    # к факультету — по ним строим выбор без единого текстового ввода
+    # ------------------------------------------------------------------
+    async def get_faculties(self) -> list[dict]:
+        try:
+            resp = await self._client.get("/api/dictionary/faculties")
+        except httpx.HTTPError as e:
+            raise RuzApiError(
+                "Сайт с расписанием сейчас не отвечает (проблема на его стороне). "
+                "Попробуй ещё раз через минуту."
+            ) from e
+        if resp.status_code != 200:
+            raise RuzApiError(f"Справочник факультетов вернул код {resp.status_code}.")
+        try:
+            return resp.json()
+        except ValueError:
+            raise RuzApiError("Справочник факультетов пришёл не в JSON-формате.")
+
+    async def get_groups_dictionary(self) -> list[dict]:
+        try:
+            resp = await self._client.get("/api/dictionary/groups")
+        except httpx.HTTPError as e:
+            raise RuzApiError(
+                "Сайт с расписанием сейчас не отвечает (проблема на его стороне). "
+                "Попробуй ещё раз через минуту."
+            ) from e
+        if resp.status_code != 200:
+            raise RuzApiError(f"Справочник групп вернул код {resp.status_code}.")
+        try:
+            return resp.json()
+        except ValueError:
+            raise RuzApiError("Справочник групп пришёл не в JSON-формате.")
+
+    # ------------------------------------------------------------------
     # Расписание группы за диапазон дат
     # ------------------------------------------------------------------
     async def get_schedule(
